@@ -7,8 +7,6 @@ import httpx
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize the Client on startup and add it to the state
-    # http://127.0.0.1:8001/ is the base_url of the other server that requests should be forwarded to
     async with httpx.AsyncClient(base_url='http://127.0.0.1:4040/') as client:
         yield {'client': client}
         # The Client closes on shutdown 

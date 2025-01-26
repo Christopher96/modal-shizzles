@@ -1,16 +1,18 @@
 import modal
 import httpx
 import subprocess
+import requests
+import time
+
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 from contextlib import asynccontextmanager
-import time
 
 image = (
     modal.Image.debian_slim()
-        .pip_install("fastapi[standard]", "pydantic", "rich")
+        .pip_install("fastapi[standard]", "pydantic", "rich", "requests")
         .apt_install("nodejs", "npm", "net-tools")
         .run_commands("npm install create-expo-app -g")
         .run_commands("create-expo-app -y app")
@@ -23,12 +25,15 @@ image = (
 
 app = modal.App("expo-proxy", image=image)
 
+
+# Create a persisted dict - the data gets retained between app runs
+global_dict = modal.Dict.from_name("global_dict", create_if_missing=True)
+
 @app.function()
 def start_server():
     with modal.enable_output():
         # print("Creating sandbox")
         # sb = modal.Sandbox.create(app=app, image=image, unencrypted_ports=[4040])
-        # print("Starting expo devserver")
         # p = sb.exec("npx", "expo", "start", "--tunnel")
         #
         # for line in p.stdout:
@@ -36,76 +41,83 @@ def start_server():
         #     if "Logs" in line:
         #         break
         #
-        # p2 = sb.exec("netstat", "-tlpn")
-        #
-        # for line in p2.stdout:
-        #     print(line, end="")
         #
         # time.sleep(2)
         # print("Forwarding port")
         # tunnel = sb.tunnels()[4040]
         #
+        # global_dict["target_host"] = tunnel.unencrypted_host
+        # global_dict["target_port"] = tunnel.unencrypted_port
+        #
         # print(f"{tunnel.url}")
         # print(f"http://{tunnel.unencrypted_host}:{tunnel.unencrypted_port}")
+        #
+        # p2 = sb.exec("netstat", "-tlpn")
+        #
+        # for line in p2.stdout:
+        #     print(line, end="")
         #
         # p.wait()
         # sb.terminate()
 
-        with modal.forward(8081, unencrypted=True) as tunnel:
-            p = subprocess.Popen("npx expo start -g", shell=True, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
-            while True:
-                line = p.stdout.readline().decode("utf-8")
-                print(line)
-                if "Logs" in line:
-                    subprocess.run(["netstat", "-tlpn"])
-                    print(f"{tunnel.url}")
-                    print(f"http://{tunnel.unencrypted_host}:{tunnel.unencrypted_port}")
+        p = subprocess.Popen("npx expo start --tunnel", shell=True, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+        while True:
+            line = p.stdout.readline().decode("utf-8")
+            print(line)
+            if "Logs" in line:
+                subprocess.run(["netstat", "-tlpn"])
+                r = requests.get("http://127.0.0.1:4040/api/tunnels")
+                data = r.json()
+                for tunnel in data["tunnels"]:
+                    print(tunnel["public_url"])
 
-                if not line:
-                    break
+                # print(f"{tunnel.url}")
+                # print(f"http://{tunnel.unencrypted_host}:{tunnel.unencrypted_port}")
+
+            if not line:
+                break
 
 
 @app.local_entrypoint()
 def main():
+    global_dict["target_host"] = "127.0.0.1"
+    global_dict["target_port"] = "4040"
     start_server.remote()
 
-#
-# target_host = "127.0.0.1"
-# target_port = "4040"
-#
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     async with httpx.AsyncClient(base_url=f'http://{target_host}:{target_port}/') as client:
-#         yield {'client': client}
-#         # The Client closes on shutdown 
-#
-# web_app = FastAPI(lifespan=lifespan)
-#
-# async def _reverse_proxy(request: Request):
-#     subprocess.run(["netstat", "-tlpn"], shell=True)
-#
-#     client = request.state.client
-#     url = httpx.URL(path=request.url.path, query=request.url.query.encode('utf-8'))
-#     headers = [(k, v) for k, v in request.headers.raw if k != b'host']
-#     req = client.build_request(
-#         request.method, url, headers=headers, content=request.stream()
-#     )
-#     r = await client.send(req, stream=True)
-#     return StreamingResponse(
-#         r.aiter_raw(),
-#         status_code=r.status_code,
-#         headers=r.headers,
-#         background=BackgroundTask(r.aclose)
-#     )
-#
-#
-# web_app.add_route('/{path:path}', _reverse_proxy, ['GET', 'POST'])
-#
-# @app.function()
-# @modal.asgi_app()
-# def fastapi_app():
-#     return web_app
-#
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    target_url = f'http://{global_dict["target_host"]}:{global_dict["target_port"]}/'
+    print(target_url)
+
+    async with httpx.AsyncClient(base_url=target_url) as client:
+        yield {'client': client}
+
+web_app = FastAPI(lifespan=lifespan)
+
+async def _reverse_proxy(request: Request):
+    print("Request")
+    client = request.state.client
+    url = httpx.URL(path=request.url.path, query=request.url.query.encode('utf-8'))
+    headers = [(k, v) for k, v in request.headers.raw if k != b'host']
+    req = client.build_request(
+        request.method, url, headers=headers, content=request.stream()
+    )
+    r = await client.send(req, stream=True)
+    return StreamingResponse(
+        r.aiter_raw(),
+        status_code=r.status_code,
+        headers=r.headers,
+        background=BackgroundTask(r.aclose)
+    )
+
+
+web_app.add_route('/{path:path}', _reverse_proxy, ['GET', 'POST'])
+
+@app.function()
+@modal.asgi_app()
+def fastapi_app():
+    return web_app
+
 
 
 
